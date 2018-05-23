@@ -46,31 +46,41 @@ request_op(Key, VClock, Op) ->
   MaxMsgQueueLen = max_message_queue_len(),
   try erlang:process_info(Pid, message_queue_len) of
     {message_queue_len, MsgQueueLen} when MsgQueueLen > MaxMsgQueueLen ->
+      m_notify(overflowed, {inc, 1}, counter),
       {error, overflow};
     {message_queue_len, _MsgQueueLen} ->
-      gen_server:call(Pid, Args, infinity)
+      m_notify(writes, {inc, 1}, counter),
+      m_notify_ms(write_ms, fun () ->
+        gen_server:call(Pid, Args, infinity)
+      end)
   catch error:badarg ->
     exit({noproc, {gen_server, call, [?MODULE, Args]}})
   end.
 
 -spec(keys(ets:match_spec()) -> [key()]).
 keys(MatchSpec) ->
-  op_getkeys(MatchSpec).
+  m_notify(reads, {inc, 1}, counter),
+  m_notify_ms(read_ms, fun () ->
+    op_getkeys(MatchSpec)
+  end).
 
 -spec(value(Key :: key()) -> riak_dt_map:value()).
 value(Key) ->
-  {_, KV} = op_getkv(Key),
-  riak_dt_map:value(KV#kv2.map).
-
+  {Value, _VClock} = value2(Key),
+  Value.
 
 -spec(value2(Key :: key()) -> {riak_dt_map:value(), riak_dt_vclock:vclock()}).
 value2(Key) ->
-  {_, KV} = op_getkv(Key),
-  {riak_dt_map:value(KV#kv2.map), KV#kv2.vclock}.
+  m_notify(reads, {inc, 1}, counter),
+  m_notify_ms(read_ms, fun () ->
+    {_, KV} = op_getkv(Key),
+    {riak_dt_map:value(KV#kv2.map), KV#kv2.vclock}
+  end).
 
 -spec(start_link() ->
   {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
 start_link() ->
+  init_metrics(),
   gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 %%%===================================================================
@@ -105,6 +115,7 @@ handle_info({lashup_gm_mc_event, Event = #{ref := Ref}}, State = #state{mc_ref =
   MaxMsgQueueLen = max_message_queue_len(),
   case erlang:process_info(self(), message_queue_len) of
     {message_queue_len, MsgQueueLen} when MsgQueueLen > MaxMsgQueueLen ->
+      m_notify(overflowed, {inc, 1}, counter),
       lager:error("lashup_kv: message box is overflowed, ~p", [MsgQueueLen]),
       {noreply, State};
     {message_queue_len, _MsgQueueLen} ->
@@ -168,7 +179,8 @@ init_db(Nodes) ->
   lists:foreach(fun create_table/1, TablesToCreate),
   case mnesia:wait_for_tables(Alltables, 60000) of
     ok ->
-      ok = maybe_upgrade_table(ExistingTables);
+      ok = maybe_upgrade_table(ExistingTables),
+      ok = m_notify_size();
     {timeout, BadTables} ->
       lager:alert("Couldn't initialize mnesia tables: ~p", [BadTables]),
       init:stop(1);
@@ -273,10 +285,12 @@ handle_op(Key, Op, OldVClock, State) ->
     {atomic, NewKV} ->
       ok = mnesia:sync_log(),
       dumped = mnesia:dump_log(),
+      ok = m_notify_size(),
       propagate(NewKV),
       NewValue = riak_dt_map:value(NewKV#kv2.map),
       {{ok, NewValue}, State};
     {aborted, Reason} ->
+      ok = m_notify_size(),
       {{error, Reason}, State}
   end.
 
@@ -400,9 +414,50 @@ create_full_update(KV = #kv2{vclock = LocalVClock}, RemoteMap, RemoteVClock) ->
 
 -spec(handle_full_update(map(), state()) -> state()).
 handle_full_update(_Payload = #{key := Key, vclock := RemoteVClock, map := RemoteMap}, State) ->
-  Fun = mk_full_update_fun(Key, RemoteMap, RemoteVClock),
-  {atomic, _} = mnesia:sync_transaction(Fun),
-  State.
+  m_notify(full_updates, {inc, 1}, counter),
+  m_notify_ms(full_update_ms, fun () ->
+    Fun = mk_full_update_fun(Key, RemoteMap, RemoteVClock),
+    {atomic, _} = mnesia:sync_transaction(Fun),
+    ok = m_notify_size(),
+    State
+  end).
 
 increment_lclock(N) ->
   N + 1.
+
+%%%===================================================================
+%%% Metrics functions
+%%%===================================================================
+
+-define(METRIC(Key), {lashup, kv, Key}).
+-define(SLIDE_WINDOW, 5). % seconds
+-define(SLIDE_SIZE, 1024).
+
+-spec(init_metrics() -> ok).
+init_metrics() ->
+  lists:foreach(fun (Key) ->
+    _ = folsom_metrics:new_histogram(
+          ?METRIC(Key), slide_uniform,
+          {?SLIDE_WINDOW, ?SLIDE_SIZE})
+  end, [full_update_ms, read_ms, write_ms]).
+
+-spec(m_notify(Key :: atom(), Value :: any(), Type :: atom()) -> ok).
+m_notify(Key, Value, Type) ->
+  folsom_metrics:notify(?METRIC(Key), Value, Type).
+
+-spec(m_notify_ms(Key, Fun :: fun (() -> A)) -> A
+  when Key :: atom(), A :: any()).
+m_notify_ms(Key, Fun) ->
+  Begin = erlang:monotonic_time(millisecond),
+  try
+    Fun()
+  after
+    Ms = erlang:monotonic_time(millisecond) - Begin,
+    true = folsom_metrics_histogram:update(?METRIC(Key), Ms)
+  end.
+
+-spec(m_notify_size() -> ok).
+m_notify_size() ->
+  WordSize = erlang:system_info(wordsize),
+  Size = WordSize * mnesia:table_info(kv2, memory),
+  m_notify(size, Size, gauge).
