@@ -13,20 +13,35 @@
   keys/1,
   value/1,
   value2/1,
-  dirty_get_lclock/1
+  raw_value/1,
+  descends/2,
+  subscribe/1,
+  handle_event/2,
+  first_key/0,
+  next_key/1,
+  read_lclock/1,
+  write_lclock/2
 ]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2,
   handle_info/2, terminate/2, code_change/3]).
 
--export_type([key/0]).
+-export_type([key/0, kv2map/0, kv2raw/0]).
 
 -define(INIT_LCLOCK, -1).
 -define(WARN_OBJECT_SIZE_MB, 60).
 -define(REJECT_OBJECT_SIZE_MB, 100).
 -define(MAX_MESSAGE_QUEUE_LEN, 32).
 -define(KV_TOPIC, lashup_kv_20161114).
+
+-type kv2map() :: #{key => key(),
+                    value => riak_dt_map:value(),
+                    old_value => riak_dt_map:value()}.
+-type kv2raw() :: #{key => key(),
+                    value => term(),
+                    vclock => riak_dt_vclock:vclock(),
+                    lclock => non_neg_integer()}.
 
 -record(state, {
   mc_ref = erlang:error() :: reference()
@@ -75,6 +90,79 @@ value2(Key) ->
   m_notify_ms(read_ms, fun () ->
     {_, KV} = op_getkv(Key),
     {riak_dt_map:value(KV#kv2.map), KV#kv2.vclock}
+  end).
+
+-spec(raw_value(key()) -> kv2raw() | false).
+raw_value(Key) ->
+  m_notify(reads, {inc, 1}, counter),
+  m_notify_ms(read_ms, fun () ->
+    case mnesia:dirty_read(?KV_TABLE, Key) of
+      [#kv2{map=Map, vclock=VClock, lclock=LClock}] ->
+        #{key => Key, value => Map, vclock => VClock, lclock => LClock};
+      [] -> false
+    end
+  end).
+
+-spec(descends(key(), riak_dt_vclock:vclock()) -> boolean()).
+descends(Key, VClock) ->
+  %% Check if LocalVClock is a direct descendant of the VClock
+  m_notify(reads, {inc, 1}, counter),
+  m_notify_ms(read_ms, fun () ->
+    case mnesia:dirty_read(?KV_TABLE, Key) of
+      [] -> false;
+      [#kv2{vclock = LocalVClock}] ->
+        riak_dt_vclock:descends(LocalVClock, VClock)
+    end
+  end).
+
+-spec(subscribe(ets:match_spec()) -> {ok, ets:comp_match_spec(), [kv2map()]}).
+subscribe(MatchSpec) ->
+  m_notify(reads, {inc, 1}, counter),
+  m_notify_ms(read_ms, fun () ->
+    ok = mnesia:wait_for_tables([?KV_TABLE], infinity),
+    mnesia:subscribe({table, ?KV_TABLE, detailed}),
+    MatchSpecKV2 = matchspec_kv2(MatchSpec),
+    Records = mnesia:dirty_select(?KV_TABLE, MatchSpecKV2),
+    ok = m_notify_subscribers(),
+    {ok, ets:match_spec_compile(MatchSpecKV2),
+     lists:map(fun kv2map/1, Records)}
+  end).
+
+-spec(handle_event(ets:comp_match_spec(), Event) -> false | kv2map()
+    when Event :: {write, ?KV_TABLE, kv(), [kv()], any()}).
+handle_event(Spec, {write, ?KV_TABLE, New, OldRecords, _ActivityId}) ->
+  m_notify(reads, {inc, 1}, counter),
+  case ets:match_spec_run([New], Spec) of
+    [New] -> kv2map(New, OldRecords);
+    [] -> false
+  end.
+
+-spec(first_key() -> key() | '$end_of_table').
+first_key() ->
+  m_notify(reads, {inc, 1}, counter),
+  mnesia:dirty_first(?KV_TABLE).
+
+-spec(next_key(key()) -> key() | '$end_of_table').
+next_key(Key) ->
+  m_notify(reads, {inc, 1}, counter),
+  mnesia:dirty_next(?KV_TABLE, Key).
+
+-spec(read_lclock(node()) -> lclock()).
+read_lclock(Node) ->
+  get_lclock(fun mnesia:dirty_read/2, Node).
+
+-spec(write_lclock(node(), lclock()) -> ok | {error, term()}).
+write_lclock(Node, LClock) ->
+  m_notify(writes, {inc, 1}, counter),
+  m_notify_ms(write_ms, fun () ->
+    Fun = fun () -> mnesia:write(#nclock{key = Node, lclock = LClock}) end,
+    case mnesia:sync_transaction(Fun) of
+      {atomic, _} ->
+        ok;
+      {aborted, Reason} ->
+        lager:error("Couldn't write to nclock table because ~p", [Reason]),
+        {error, Reason}
+    end
   end).
 
 -spec(start_link() ->
@@ -332,10 +420,6 @@ op_getkeys(MatchSpec) ->
   MatchSpecCompiled = ets:match_spec_compile(MatchSpec),
   [Key || Key <- Keys, [true] == ets:match_spec_run([{Key}], MatchSpecCompiled)].
 
--spec(dirty_get_lclock(node()) -> lclock()).
-dirty_get_lclock(Key) ->
-  get_lclock(fun mnesia:dirty_read/2, Key).
-
 -spec(get_lclock(node()) -> lclock()).
 get_lclock(Key) ->
   get_lclock(fun mnesia:read/2, Key).
@@ -425,6 +509,27 @@ handle_full_update(_Payload = #{key := Key, vclock := RemoteVClock, map := Remot
 increment_lclock(N) ->
   N + 1.
 
+-spec(matchspec_kv2(ets:match_spec()) -> ets:match_spec()).
+matchspec_kv2({{Key}, Conditions, [true]}) ->
+  {#kv2{key = Key, map = '_',
+        vclock = '_', lclock = '_'},
+   Conditions, ['$_']};
+matchspec_kv2(MatchSpec) ->
+  lists:map(fun matchspec_kv2/1, MatchSpec).
+
+-spec(kv2map(kv()) -> kv2map()).
+kv2map(#kv2{key = Key, map = Map}) ->
+  #{key => Key, value => riak_dt_map:value(Map)}.
+
+-spec(kv2map(kv(), [kv()]) -> kv2map()).
+kv2map(New, []) ->
+  kv2map(New);
+kv2map(New, [Old | _]) ->
+  Map = kv2map(New),
+  #{value := OldValue} = kv2map(Old),
+  Map#{old_value => OldValue}.
+
+
 %%%===================================================================
 %%% Metrics functions
 %%%===================================================================
@@ -461,3 +566,8 @@ m_notify_size() ->
   WordSize = erlang:system_info(wordsize),
   Size = WordSize * mnesia:table_info(kv2, memory),
   m_notify(size, Size, gauge).
+
+-spec(m_notify_subscribers() -> ok).
+m_notify_subscribers() ->
+    Subscribers = mnesia:table_info(?KV_TABLE, subscribers),
+    m_notify(subscribers, length(Subscribers), gauge).
